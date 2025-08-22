@@ -145,9 +145,9 @@ class DataVisualizer:
                     print(f"删除旧饼图失败：{str(e)}")
 
             # 5. 保存图片（直接保存，不显示窗口）
-            plt.tight_layout()  # 调整布局，避免标签被截断
-            plt.savefig(save_path, dpi=150, bbox_inches='tight')  # 保存为文件
-            plt.close(fig)  # 强制关闭画布，释放内存（关键：避免内存泄漏）
+            plt.tight_layout()
+            plt.savefig(save_path, dpi=150, bbox_inches='tight')
+            plt.close(fig)  # 强制关闭画布，释放内存
 
             if os.path.exists(save_path):
                 print(f"分类饼图已保存到：{save_path}")
@@ -387,4 +387,5 @@ class DataVisualizer:
             for category, count in sorted(classification_counts.items(), key=lambda x: x[1], reverse=True):
                 report.append(f"{category}: {count} 笔")
         
-        return "\n".join(report) 
+        return "\n".join(report)
+
