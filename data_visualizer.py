@@ -145,9 +145,9 @@ class DataVisualizer:
                     print(f"删除旧饼图失败：{str(e)}")
 
             # 5. 保存图片（直接保存，不显示窗口）
-            plt.tight_layout()  # 调整布局，避免标签被截断
-            plt.savefig(save_path, dpi=150, bbox_inches='tight')  # 保存为文件
-            plt.close(fig)  # 强制关闭画布，释放内存（关键：避免内存泄漏）
+            plt.tight_layout()
+            plt.savefig(save_path, dpi=150, bbox_inches='tight')
+            plt.close(fig)  # 强制关闭画布，释放内存
 
             if os.path.exists(save_path):
                 print(f"分类饼图已保存到：{save_path}")
@@ -346,6 +346,32 @@ class DataVisualizer:
         return base.replace('</body>', script + '\n</body>')
     
     def create_summary_report(self, stats: Dict, special: Optional[Dict] = None) -> str:
+        import json
+        # 类型安全转换工具
+        def safe_float(val):
+            try:
+                return float(val)
+            except Exception:
+                return 0.0
+        def safe_dict(val):
+            if isinstance(val, dict):
+                return val
+            if isinstance(val, str):
+                try:
+                    return json.loads(val.replace("'", '"'))
+                except Exception:
+                    return {}
+            return {}
+
+        # 修正stats中的金额字段和嵌套dict
+        for key in ['总收入', '总支出', '净收入', '非收支总额']:
+            if key in stats:
+                stats[key] = safe_float(stats[key])
+        if '分类统计' in stats:
+            stats['分类统计'] = safe_dict(stats['分类统计'])
+        if '平台统计' in stats:
+            stats['平台统计'] = safe_dict(stats['平台统计'])
+
         report = []
         report.append("=" * 50)
         report.append("个人记账管理系统 - 月度统计报告")
@@ -359,12 +385,16 @@ class DataVisualizer:
         report.append("")
         report.append("【分类统计】")
         classification_amounts = (stats.get('分类统计', {}) or {}).get('金额', {})
+        if isinstance(classification_amounts, str):
+            classification_amounts = safe_dict(classification_amounts)
         for category, amount in sorted(classification_amounts.items(), key=lambda x: x[1], reverse=True):
             if amount > 0:
                 report.append(f"{category}: ¥{amount:.2f}")
         report.append("")
         report.append("【平台统计】")
         platform_stats = stats.get('平台统计', {})
+        if isinstance(platform_stats, str):
+            platform_stats = safe_dict(platform_stats)
         for platform, data in platform_stats.items():
             if isinstance(data, dict) and 'sum' in data and 'count' in data:
                 report.append(f"{platform}: ¥{float(data['sum']):.2f} ({int(data['count'])}笔)")
@@ -378,13 +408,14 @@ class DataVisualizer:
                     report.append(f"{k}: ¥{amount:.2f}（{count} 笔）")
                 else:
                     report.append(f"{k}: {v}")
-        
         # 添加分类数量统计
         classification_counts = (stats.get('分类统计', {}) or {}).get('数量', {})
+        if isinstance(classification_counts, str):
+            classification_counts = safe_dict(classification_counts)
         if classification_counts:
             report.append("")
             report.append("【分类数量统计】")
             for category, count in sorted(classification_counts.items(), key=lambda x: x[1], reverse=True):
                 report.append(f"{category}: {count} 笔")
-        
-        return "\n".join(report) 
+        return "\n".join(report)
+

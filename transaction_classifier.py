@@ -7,6 +7,7 @@ import pandas as pd
 import json
 from typing import Dict, Optional
 import os
+import re
 
 
 class TransactionClassifier:
@@ -35,64 +36,106 @@ class TransactionClassifier:
 
     def save_user_rules(self):
         try:
-            # 确保文件夹存在
-            if not os.path.exists(os.path.dirname(self.user_rules_file)):
-                os.makedirs(os.path.dirname(self.user_rules_file), exist_ok=True)
-
+            # 只有内容有变化时才保存，减少磁盘写入和控制台输出
+            if os.path.exists(self.user_rules_file):
+                with open(self.user_rules_file, 'r', encoding='utf-8') as f:
+                    old_data = json.load(f)
+                if old_data == self.user_classifications:
+                    return  # 无变化则不保存
+            dir_path = os.path.dirname(self.user_rules_file)
+            if dir_path and not os.path.exists(dir_path):
+                os.makedirs(dir_path, exist_ok=True)
             with open(self.user_rules_file, 'w', encoding='utf-8') as f:
                 json.dump(self.user_classifications, f, ensure_ascii=False, indent=2)
-
-            # 验证保存结果
-            if os.path.exists(self.user_rules_file):
-                print(f"用户规则已保存到 {self.user_rules_file}，共 {len(self.user_classifications)} 条")
-            else:
-                print(f"警告：用户规则保存路径不存在 {self.user_rules_file}")
+            # 控制台输出只保留一次
+            print(f"用户规则已保存到 {self.user_rules_file}，共 {len(self.user_classifications)} 条")
         except Exception as e:
             print(f"保存用户规则失败：{str(e)}")
     
     def _text(self, value) -> str:
         return str(value or '').lower()
 
-    def classify_transaction(self, row: pd.Series) -> str:
-        """分类优先级：
-        1) 跨平台转账标记 True → 非收支
-        2) 关键词 非收支
-        3) 按收/支 分别匹配关键词
-        4) 未分类
-        """
+    def classify_transaction(self, row: pd.Series) -> tuple:
+        # 新增：失败状态直接返回特殊分类
+        fail_status_keywords = ['对方已退还', '已全额退款', '还款失败', '失败', '退款', '退还']
+        status = str(row.get('交易状态', '') or '').strip()
+        if any(kw in status for kw in fail_status_keywords):
+            return '未达到分类要求', 'status_filter'
+        try:
+            amount = float(row.get('金额', 0) or 0)
+            party = str(row.get('交易对方', '') or '').strip()
+            desc = str(row.get('商品说明', '') or '').strip()
+            # 生成金额区间
+            fuzzy_config = self.config.get('系统设置', {}).get('金额模糊化', {})
+            enable_fuzzy = fuzzy_config.get('启用', True)
+            ignore_amount = fuzzy_config.get('忽略金额', False)
+            intervals = fuzzy_config.get('区间设置', [0, 10, 20, 50, 100, 300, 500])
+            max_label = fuzzy_config.get('超出最大区间的标识', '500+')
+            amount_part = ""
+            if not ignore_amount:
+                amount_abs = abs(amount)
+                amount_label = max_label
+                if amount_abs == 0:
+                    amount_label = "0"
+                else:
+                    for i in range(len(intervals) - 1):
+                        min_amt = intervals[i]
+                        max_amt = intervals[i + 1]
+                        if min_amt <= amount_abs < max_amt:
+                            amount_label = f"{min_amt}-{max_amt}"
+                            break
+                amount_part = f"{amount_label}"
+            # 指纹key
+            key = f"{amount_part}_{party}"
+            # 1. user_rules.json优先，商品说明正则匹配
+            rules = self.user_classifications.get(key, [])
+            for rule in rules:
+                try:
+                    pattern = rule.get("desc_regex", "")
+                    if pattern and re.search(pattern, desc):
+                        print(f"【调试】user_rules命中: {key} | {pattern} -> {rule.get('category')}")
+                        return rule.get("category"), "user_rules"
+                except Exception as e:
+                    print(f"【调试】user_rules正则异常: {e}")
+            # 2. user_rules模糊匹配（只用金额区间+对方，无商品说明）
+            if rules:
+                print(f"【调试】user_rules模糊命中: {key}（无商品说明）-> {rules[0].get('category')}")
+                return rules[0].get('category'), "user_rules"
+            # 3. 未命中，输出未匹配指纹
+            print(f"【调试】user_rules未命中: {key}_{desc}")
+        except Exception as e:
+            print(f"【调试】user_rules匹配异常: {e}")
+
         # 1) 跨平台转账优先
         if bool(row.get('跨平台转账', False)):
-            return '非收支'
-        
+            return '非收支', "config"
+        # 2) config规则
         t_type = self._text(row.get('交易分类', ''))
         desc = self._text(row.get('商品说明', ''))
         party = self._text(row.get('交易对方', ''))
         income_expense = self._text(row.get('收/支', ''))  # 使用收/支字段
         haystack = f"{t_type} {desc} {party}"
-        
         # 2) 非收支关键词
         for kw in self.classification_rules.get('非收支', []):
             if self._text(kw) in haystack:
-                return '非收支'
-        
+                return '非收支', "config"
         # 3) 支出 / 收入
         if '支出' in income_expense:
             for cate, kws in self.classification_rules.get('支出', {}).items():
                 for kw in kws:
                     if self._text(kw) in haystack:
-                        return f'支出-{cate}'
-            return '支出-其他'
+                        return f'支出-{cate}', "config"
+            return '支出-其他', "config"
         if '收入' in income_expense:
             for cate, kws in self.classification_rules.get('收入', {}).items():
                 for kw in kws:
                     if self._text(kw) in haystack:
-                        return f'收入-{cate}'
-            return '收入-其他'
-        return '未分类'
+                        return f'收入-{cate}', "config"
+            return '收入-其他', "config"
+        return '未分类', "config"
 
     def _fingerprint(self, row: pd.Series) -> str:
-        """优化后：支持配置“是否忽略金额”，指纹=（金额相关_）交易对方_商品说明"""
-        # 1. 提取交易核心信息（交易对方、商品说明，去空格避免差异）
+        """指纹=金额区间_交易对方_商品说明，全部去除多余空格"""
         party = str(row.get('交易对方', '') or '').strip()
         desc = str(row.get('商品说明', '') or '').strip()
 
@@ -132,65 +175,112 @@ class TransactionClassifier:
                 amount_part = f"{amount_val:.0f}_"
 
         # 4. 生成最终指纹（忽略金额时：交易对方_商品说明；不忽略时：金额标识_交易对方_商品说明）
-        return f"{amount_part}{party}_{desc}"
-    
+        return f"{amount_part}{party}_{desc}".strip()
+
+    def _fingerprint_with_custom_desc(self, row: pd.Series, desc: str) -> str:
+        party = str(row.get('交易对方', '') or '').strip()
+        # 金额区间部分同原逻辑
+        fuzzy_config = self.config.get('系统设置', {}).get('金额模糊化', {})
+        enable_fuzzy = fuzzy_config.get('启用', True)
+        ignore_amount = fuzzy_config.get('忽略金额', False)
+        intervals = fuzzy_config.get('区间设置', [0, 5, 20, 50, 100])
+        max_label = fuzzy_config.get('超出最大区间的标识', '100+')
+        amount_part = ""
+        if not ignore_amount:
+            amount = row.get('金额', 0)
+            try:
+                amount_val = float(amount)
+            except Exception:
+                amount_val = 0.0
+            amount_abs = abs(amount_val)
+            if enable_fuzzy:
+                amount_label = max_label
+                if amount_abs == 0:
+                    amount_label = "0"
+                else:
+                    for i in range(len(intervals) - 1):
+                        min_amt = intervals[i]
+                        max_amt = intervals[i + 1]
+                        if min_amt <= amount_abs < max_amt:
+                            amount_label = f"{min_amt}-{max_amt}"
+                            break
+                amount_part = f"{amount_label}_"
+            else:
+                amount_part = f"{amount_val:.0f}_"
+        return f"{amount_part}{party}_{desc}".strip()
+
     def classify_all_transactions(self, df: pd.DataFrame) -> pd.DataFrame:
-        """分类所有交易记录"""
+        """分类所有交易记录，优先应用user_rules"""
+        if '分类' in df.columns and '分类来源' in df.columns:
+            return df  # 如果已经分类，直接返回，避免重复计算
         df_copy = df.copy()
-        
-        # 添加分类字段
-        df_copy['分类'] = df_copy.apply(self.classify_transaction, axis=1)
-        
-        # 应用用户记忆
-        for idx, row in df_copy.iterrows():
-            fp = self._fingerprint(row)
-            if fp in self.user_classifications:
-                df_copy.at[idx, '分类'] = self.user_classifications[fp]
-        
+        # 添加分类字段和分类来源字段
+        results = df_copy.apply(self.classify_transaction, axis=1)
+        df_copy['分类'] = results.apply(lambda x: x[0])
+        df_copy['分类来源'] = results.apply(lambda x: x[1])
         return df_copy
-    
+
     def add_user_classification(self, row: pd.Series, classification: str, persist: bool = True):
         self.user_classifications[self._fingerprint(row)] = classification
         if persist:
             self.save_user_rules()
 
     def get_classification_statistics(self, df: pd.DataFrame) -> Dict:
+        print("【调试】进入 get_classification_statistics，数据行数：", len(df))
         stats: Dict = {}
-        # 关键：先检查“分类”或“调整后分类”字段是否存在，不存在则用默认字段
-        if '调整后分类' in df.columns and not df['调整后分类'].empty:
-            category_field = '调整后分类'  # 优先用BillParser生成的“调整后分类”
-        elif '分类' in df.columns and not df['分类'].empty:
-            category_field = '分类'
-        else:
-            # 若都没有，临时添加“分类”字段（避免报错）
-            df['分类'] = '未分类'
-            category_field = '分类'
+        try:
+            # 检查关键字段
+            print("【调试】字段列表：", df.columns.tolist())
+            # 关键：先检查“分类”或“调整后分类”字段是否存在，不存在则用默认字段
+            if '调整后分类' in df.columns and not df['调整后分类'].empty:
+                category_field = '调整后分类'
+            elif '分类' in df.columns and not df['分类'].empty:
+                category_field = '分类'
+            else:
+                # 若都没有，临时添加“分类”字段（避免报错）
+                df['分类'] = '未分类'
+                category_field = '分类'
 
-        # 修复：统计时先过滤无效金额（确保金额是数值型）
-        df_copy = df.copy()
-        df_copy['金额'] = pd.to_numeric(df_copy['金额'], errors='coerce').fillna(0)
+            # 金额字段类型转换
+            df_copy = df.copy()
+            df_copy['金额'] = pd.to_numeric(df_copy['金额'], errors='coerce').fillna(0)
 
-        # 计算总收入/总支出（用category_field，避免硬编码“分类”）
-        stats['总收入'] = df_copy[df_copy[category_field].str.startswith('收入', na=False)]['金额'].sum()
-        stats['总支出'] = df_copy[df_copy[category_field].str.startswith('支出', na=False)]['金额'].sum()
-        stats['非收支总额'] = df_copy[df_copy[category_field] == '非收支']['金额'].sum()
-        stats['净收入'] = stats['总收入'] - stats['总支出']
+            # 统计前输出部分数据
+            print("【调试】分类字段样例：", df_copy[category_field].head(5).tolist())
+            print("【调试】金额字段样例：", df_copy['金额'].head(5).tolist())
 
-        # 分类统计（同样用category_field）
-        stats['分类统计'] = {
-            '数量': df_copy[category_field].value_counts(dropna=False).to_dict(),
-            '金额': df_copy.groupby(category_field, dropna=False)['金额'].sum().to_dict()
-        }
+            # 计算总收入/总支出
+            stats['总收入'] = df_copy[df_copy[category_field].str.startswith('收入', na=False)]['金额'].sum()
+            stats['总支出'] = df_copy[df_copy[category_field].str.startswith('支出', na=False)]['金额'].sum()
+            stats['非收支总额'] = df_copy[df_copy[category_field] == '非收支']['金额'].sum()
+            stats['净收入'] = stats['总收入'] - stats['总支出']
 
-        # 平台统计（检查“平台”字段是否存在）
-        if '平台' in df_copy.columns:
-            platform_agg = df_copy.groupby('平台', dropna=False)['金额'].agg(['sum', 'count']).round(2)
-            stats['平台统计'] = platform_agg.to_dict()
-        else:
-            stats['平台统计'] = {'sum': {}, 'count': {}}  # 无平台字段时返回空
+            # 分类统计
+            stats['分类统计'] = {
+                '数量': df_copy[category_field].value_counts(dropna=False).to_dict(),
+                '金额': df_copy.groupby(category_field, dropna=False)['金额'].sum().to_dict()
+            }
 
-        return stats
-    
+            # 平台统计
+            if '平台' in df_copy.columns:
+                platform_agg = df_copy.groupby('平台', dropna=False)['金额'].agg(['sum', 'count']).round(2)
+                stats['平台统计'] = platform_agg.to_dict()
+            else:
+                stats['平台统计'] = {'sum': {}, 'count': {}}
+
+            print("【调试】统计结果预览：", {k: str(v)[:200] for k, v in stats.items()})
+            return stats
+        except Exception as e:
+            import traceback
+            print("【调试】get_classification_statistics异常：", str(e))
+            print(traceback.format_exc())
+            # 返回空统计，避免程序崩溃
+            return {
+                '总收入': 0, '总支出': 0, '净收入': 0,
+                '分类统计': {'数量': {}, '金额': {}},
+                '平台统计': {'sum': {}, 'count': {}}
+            }
+
     def get_daily_statistics(self, df: pd.DataFrame) -> pd.DataFrame:
         df_copy = df.copy()
         df_copy['日期'] = pd.to_datetime(df_copy['交易时间'], errors='coerce').dt.date
@@ -226,4 +316,4 @@ class TransactionClassifier:
         return {
             '金额': float(g['金额'].sum() if not g.empty else 0),
             '笔数': int(len(g))
-        } 
+        }
