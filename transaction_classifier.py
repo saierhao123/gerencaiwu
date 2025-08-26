@@ -65,6 +65,12 @@ class TransactionClassifier:
             amount = float(row.get('金额', 0) or 0)
             party = str(row.get('交易对方', '') or '').strip()
             desc = str(row.get('商品说明', '') or '').strip()
+            # 新增：提取小时字段
+            time_str = str(row.get('交易时间', '') or '')
+            try:
+                hour = pd.to_datetime(time_str).hour
+            except Exception:
+                hour = ''
             # 生成金额区间
             fuzzy_config = self.config.get('系统设置', {}).get('金额模糊化', {})
             enable_fuzzy = fuzzy_config.get('启用', True)
@@ -84,25 +90,60 @@ class TransactionClassifier:
                         if min_amt <= amount_abs < max_amt:
                             amount_label = f"{min_amt}-{max_amt}"
                             break
-                amount_part = f"{amount_label}"
-            # 指纹key
-            key = f"{amount_part}_{party}"
-            # 1. user_rules.json优先，商品说明正则匹配
-            rules = self.user_classifications.get(key, [])
-            for rule in rules:
-                try:
-                    pattern = rule.get("desc_regex", "")
-                    if pattern and re.search(pattern, desc):
-                        print(f"【调试】user_rules命中: {key} | {pattern} -> {rule.get('category')}")
-                        return rule.get("category"), "user_rules"
-                except Exception as e:
-                    print(f"【调试】user_rules正则异常: {e}")
-            # 2. user_rules模糊匹配（只用金额区间+对方，无商品说明）
-            if rules:
-                print(f"【调试】user_rules模糊命中: {key}（无商品说明）-> {rules[0].get('category')}")
-                return rules[0].get('category'), "user_rules"
+                    amount_part = f"{amount_label}"
+
+            # 生成多个可能的键，按优先级排序
+            possible_keys = [
+                f"{amount_part}_{party}_{hour}",  # 精确匹配
+                f"{amount_part}_{party}_*",  # 通用时间匹配
+            ]
+
+            # 对于一些通用商户，添加额外的匹配键
+            generic_parties = ['余额宝', '淘宝（中国）软件有限公司', '芝麻信用', '借呗', '多多有礼', '青云租']
+            if party in generic_parties:
+                possible_keys.append(f"{amount_part}_{party}_*")
+
+            # 添加正则表达式匹配
+            import re
+            matched_rules = []
+            matched_key = None
+
+            # 遍历所有可能的键
+            for key in possible_keys:
+                # 先检查精确匹配
+                if key in self.user_classifications:
+                    rules = self.user_classifications[key]
+                    matched_rules = rules
+                    matched_key = key
+                    break
+
+            # 如果没有精确匹配，尝试正则表达式匹配
+            if not matched_rules:
+                for stored_key in self.user_classifications.keys():
+                    # 将存储的键转换为正则表达式
+                    pattern = stored_key.replace('*', '.*')
+                    test_key = f"{amount_part}_{party}_{hour}"
+                    if re.match(f"^{pattern}$", test_key):
+                        matched_rules = self.user_classifications[stored_key]
+                        matched_key = stored_key
+                        break
+
+            # 如果找到匹配的规则，尝试应用
+            if matched_rules:
+                for rule in matched_rules:
+                    try:
+                        pattern = rule.get("desc_regex", "")
+                        if pattern and re.search(pattern, desc):
+                            print(f"【调试】user_rules命中: {matched_key} | {pattern} -> {rule.get('category')}")
+                            return rule.get("category"), "user_rules"
+                    except Exception as e:
+                        print(f"【调试】user_rules正则异常: {e}")
+                # 模糊匹配（只用金额区间+对方+小时，无商品说明）
+                print(f"【调试】user_rules模糊命中: {matched_key}（无商品说明）-> {matched_rules[0].get('category')}")
+                return matched_rules[0].get('category'), "user_rules"
+
             # 3. 未命中，输出未匹配指纹
-            print(f"【调试】user_rules未命中: {key}_{desc}")
+            print(f"【调试】user_rules未命中: {amount_part}_{party}_{hour}_{desc}")
         except Exception as e:
             print(f"【调试】user_rules匹配异常: {e}")
 
@@ -135,79 +176,64 @@ class TransactionClassifier:
         return '未分类', "config"
 
     def _fingerprint(self, row: pd.Series) -> str:
-        """指纹=金额区间_交易对方_商品说明，全部去除多余空格"""
+        """指纹=金额区间_交易对方_小时"""
         party = str(row.get('交易对方', '') or '').strip()
-        desc = str(row.get('商品说明', '') or '').strip()
+        time_str = str(row.get('交易时间', '') or '')
+        try:
+            hour = pd.to_datetime(time_str).hour
+        except Exception:
+            hour = ''
 
-        # 2. 从config读取“金额模糊化”配置
+        # 金额区间
         fuzzy_config = self.config.get('系统设置', {}).get('金额模糊化', {})
-        enable_fuzzy = fuzzy_config.get('启用', True)
-        ignore_amount = fuzzy_config.get('忽略金额', False)  # 读取“忽略金额”开关
-        intervals = fuzzy_config.get('区间设置', [0, 5, 20, 50, 100])
-        max_label = fuzzy_config.get('超出最大区间的标识', '100+')
+        intervals = fuzzy_config.get('区间设置', [0, 10, 20, 50, 100, 300, 500])
+        max_label = fuzzy_config.get('超出最大区间的标识', '500+')
+        amount = row.get('金额', 0)
+        try:
+            amount_val = float(amount)
+        except Exception:
+            amount_val = 0.0
+        amount_abs = abs(amount_val)
+        amount_label = max_label
+        for i in range(len(intervals) - 1):
+            if intervals[i] <= amount_abs < intervals[i + 1]:
+                amount_label = f"{intervals[i]}-{intervals[i + 1]}"
+                break
 
-        # 3. 处理金额部分（根据开关决定是否包含金额）
-        amount_part = ""  # 金额部分的字符串（空=忽略金额）
-        if not ignore_amount:
-            # 不忽略金额：按之前的区间逻辑生成金额标识
-            amount = row.get('金额', 0)
-            try:
-                amount_val = float(amount)
-            except Exception:
-                amount_val = 0.0
-            amount_abs = abs(amount_val)
+        return f"{amount_label}_{party}_{hour}"
 
-            if enable_fuzzy:
-                # 金额区间匹配
-                amount_label = max_label
-                if amount_abs == 0:
-                    amount_label = "0"
-                else:
-                    for i in range(len(intervals) - 1):
-                        min_amt = intervals[i]
-                        max_amt = intervals[i + 1]
-                        if min_amt <= amount_abs < max_amt:
-                            amount_label = f"{min_amt}-{max_amt}"
-                            break
-                amount_part = f"{amount_label}_"  # 加“_”分隔，方便后续拆分
-            else:
-                # 不启用模糊化：保留整数位金额
-                amount_part = f"{amount_val:.0f}_"
-
-        # 4. 生成最终指纹（忽略金额时：交易对方_商品说明；不忽略时：金额标识_交易对方_商品说明）
-        return f"{amount_part}{party}_{desc}".strip()
-
-    def _fingerprint_with_custom_desc(self, row: pd.Series, desc: str) -> str:
+    def _fingerprint(self, row: pd.Series) -> str:
+        """指纹=金额区间_交易对方_小时"""
         party = str(row.get('交易对方', '') or '').strip()
-        # 金额区间部分同原逻辑
+        time_str = str(row.get('交易时间', '') or '')
+        try:
+            hour = pd.to_datetime(time_str).hour
+        except Exception:
+            hour = ''
+
+        # 金额区间
         fuzzy_config = self.config.get('系统设置', {}).get('金额模糊化', {})
-        enable_fuzzy = fuzzy_config.get('启用', True)
-        ignore_amount = fuzzy_config.get('忽略金额', False)
-        intervals = fuzzy_config.get('区间设置', [0, 5, 20, 50, 100])
-        max_label = fuzzy_config.get('超出最大区间的标识', '100+')
-        amount_part = ""
-        if not ignore_amount:
-            amount = row.get('金额', 0)
-            try:
-                amount_val = float(amount)
-            except Exception:
-                amount_val = 0.0
-            amount_abs = abs(amount_val)
-            if enable_fuzzy:
-                amount_label = max_label
-                if amount_abs == 0:
-                    amount_label = "0"
-                else:
-                    for i in range(len(intervals) - 1):
-                        min_amt = intervals[i]
-                        max_amt = intervals[i + 1]
-                        if min_amt <= amount_abs < max_amt:
-                            amount_label = f"{min_amt}-{max_amt}"
-                            break
-                amount_part = f"{amount_label}_"
-            else:
-                amount_part = f"{amount_val:.0f}_"
-        return f"{amount_part}{party}_{desc}".strip()
+        intervals = fuzzy_config.get('区间设置', [0, 10, 20, 50, 100, 300, 500])
+        max_label = fuzzy_config.get('超出最大区间的标识', '500+')
+        amount = row.get('金额', 0)
+        try:
+            amount_val = float(amount)
+        except Exception:
+            amount_val = 0.0
+        amount_abs = abs(amount_val)
+        amount_label = max_label
+        for i in range(len(intervals) - 1):
+            if intervals[i] <= amount_abs < intervals[i + 1]:
+                amount_label = f"{intervals[i]}-{intervals[i + 1]}"
+                break
+
+        # 对于一些通用商户，使用更通用的指纹
+        generic_parties = ['拼多多平台商户', '抖音电商商家', '淘宝（中国）软件有限公司', '芝麻信用', '多多有礼', '借呗',
+                           '余额宝']
+        if party in generic_parties:
+            return f"{amount_label}_{party}_*"
+
+        return f"{amount_label}_{party}_{hour}"
 
     def classify_all_transactions(self, df: pd.DataFrame) -> pd.DataFrame:
         """分类所有交易记录，优先应用user_rules"""
@@ -218,6 +244,13 @@ class TransactionClassifier:
         results = df_copy.apply(self.classify_transaction, axis=1)
         df_copy['分类'] = results.apply(lambda x: x[0])
         df_copy['分类来源'] = results.apply(lambda x: x[1])
+
+        # 设置调整后分类和调整后子分类字段
+        df_copy['调整后分类'] = df_copy['分类']
+        df_copy['调整后子分类'] = df_copy['分类'].apply(
+            lambda x: x.split('-')[-1] if isinstance(x, str) and '-' in x else str(x)
+        )
+
         return df_copy
 
     def add_user_classification(self, row: pd.Series, classification: str, persist: bool = True):

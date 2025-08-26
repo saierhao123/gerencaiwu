@@ -116,26 +116,29 @@ class MainWindow(QMainWindow):
             filter_layout.addWidget(QLabel("平台筛选:"))
             self.platform_filter = QComboBox()
             self.platform_filter.addItem("全部")
+            self.platform_filter.setFixedWidth(150)
             self.platform_filter.currentTextChanged.connect(self.filter_transactions)
             filter_layout.addWidget(self.platform_filter)
             filter_layout.addWidget(QLabel("分类筛选:"))
             self.category_filter = QComboBox()
             self.category_filter.addItem("全部")
+            self.category_filter.setFixedWidth(300)
             self.category_filter.currentTextChanged.connect(self.filter_transactions)
             filter_layout.addWidget(self.category_filter)
             # 新增交易状态筛选
             filter_layout.addWidget(QLabel("交易状态筛选:"))
             self.status_filter = QComboBox()
             self.status_filter.addItems(["全部", "成功", "失败"])
+            self.status_filter.setFixedWidth(150)
             self.status_filter.currentTextChanged.connect(self.filter_transactions)
             filter_layout.addWidget(self.status_filter)
             filter_layout.addStretch()
             transaction_layout.addLayout(filter_layout)
             self.transaction_table = QTableWidget()
-            self.transaction_table.setColumnCount(13)
+            self.transaction_table.setColumnCount(12)
             self.transaction_table.setHorizontalHeaderLabels([
                 "交易时间", "平台", "交易分类", "交易对方", "商品说明",
-                "收/支", "金额", "支付方式", "交易状态", "交易单号", "调整后分类", "调整后子分类", "分类来源"
+                "收/支", "金额", "支付方式", "交易状态", "调整后分类", "调整后子分类", "分类来源"
             ])
             self.transaction_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)  # 禁止编辑
             header = self.transaction_table.horizontalHeader()
@@ -198,16 +201,15 @@ class MainWindow(QMainWindow):
             if self.df is None or self.df.empty:
                 self.transaction_table.setRowCount(0)
                 return
+
+            # 移除可能影响背景色的样式表
+            self.transaction_table.setStyleSheet("")
+
             self.transaction_table.setRowCount(len(self.df))
             self.row_to_original_index = {}
-            # 设置表格线加粗
-            self.transaction_table.setStyleSheet("""
-                QTableWidget::item {
-                    border-bottom: 2.5px solid #3399FF;
-                    border-right: 2.5px solid #3399FF;
-                }
-            """)
+
             fail_status_keywords = ['对方已退还', '已全额退款', '还款失败', '失败', '退款', '退还']
+
             for row_idx, (original_index, row_data) in enumerate(self.df.iterrows()):
                 self.row_to_original_index[row_idx] = original_index
                 time_str = str(row_data.get('交易时间', ''))
@@ -217,31 +219,47 @@ class MainWindow(QMainWindow):
                         time_str = time_obj.strftime('%Y-%m-%d %H:%M:%S')
                     except Exception:
                         pass
+
                 status_str = str(row_data.get('交易状态', ''))
                 is_fail = any(kw in status_str for kw in fail_status_keywords)
+
                 try:
                     amount_val = float(row_data.get('金额', 0) or 0)
                 except Exception:
                     amount_val = 0.0
+
+                # 确定行的背景色
+                if is_fail:
+                    row_color = QColor(255, 200, 200)  # 失败交易使用淡红色
+                elif row_idx % 2 == 0:
+                    row_color = QColor(230, 240, 188)  # 偶数行
+                else:
+                    row_color = QColor(255, 255, 255)  # 奇数行
+
                 items = [
                     QTableWidgetItem(time_str),
                     QTableWidgetItem(str(row_data.get('平台', ''))),
-                    QTableWidgetItem(str(row_data.get('交易分类', ''))),  # 保持原始平台分类
+                    QTableWidgetItem(str(row_data.get('交易分类', ''))),
                     QTableWidgetItem(str(row_data.get('交易对方', ''))),
                     QTableWidgetItem(str(row_data.get('商品说明', ''))),
                     QTableWidgetItem(str(row_data.get('收/支', ''))),
                     QTableWidgetItem(f"¥{amount_val:.2f}" if row_data.get('金额', 0) != '' else ''),
                     QTableWidgetItem(str(row_data.get('支付方式', '') or row_data.get('收/付款方式', ''))),
                     QTableWidgetItem(status_str),
-                    QTableWidgetItem(str(row_data.get('交易单号', ''))),
                     QTableWidgetItem("未达到分类" if is_fail else str(row_data.get('调整后分类', ''))),
                     QTableWidgetItem("未达到分类" if is_fail else str(row_data.get('调整后子分类', ''))),
                     QTableWidgetItem(str(row_data.get('分类来源', '')))
                 ]
+
+                # 设置所有单元格的背景色
+                for item in items:
+                    item.setBackground(row_color)
+                    # 确保背景色不会被样式覆盖
+                    item.setData(Qt.ItemDataRole.BackgroundRole, row_color)
+
                 for col, item in enumerate(items):
-                    if row_idx % 2 == 0:
-                        item.setBackground(QColor(220, 240, 255))
                     self.transaction_table.setItem(row_idx, col, item)
+
         except Exception as e:
             logging.exception("MainWindow.update_transaction_table异常")
             QMessageBox.critical(self, "错误", f"刷新表格时出错: {e}")
@@ -265,27 +283,31 @@ class MainWindow(QMainWindow):
             if self.df is None or self.df.empty:
                 self.transaction_table.setRowCount(0)
                 return
+
+            # 移除可能影响背景色的样式表
+            self.transaction_table.setStyleSheet("")
+
             platform_filter = self.platform_filter.currentText()
             category_filter = self.category_filter.currentText()
             status_filter = self.status_filter.currentText()
+
             filtered_df = self.df.copy()
             if platform_filter != "全部":
                 filtered_df = filtered_df[filtered_df['平台'] == platform_filter]
             if category_filter != "全部":
                 filtered_df = filtered_df[filtered_df['调整后分类'] == category_filter]
+
             fail_status_keywords = ['对方已退还', '已全额退款', '还款失败', '失败', '退款', '退还']
             if status_filter == "成功":
-                filtered_df = filtered_df[~filtered_df['交易状态'].astype(str).apply(lambda x: any(kw in x for kw in fail_status_keywords))]
+                filtered_df = filtered_df[~filtered_df['交易状态'].astype(str).apply(
+                    lambda x: any(kw in x for kw in fail_status_keywords))]
             elif status_filter == "失败":
-                filtered_df = filtered_df[filtered_df['交易状态'].astype(str).apply(lambda x: any(kw in x for kw in fail_status_keywords))]
+                filtered_df = filtered_df[filtered_df['交易状态'].astype(str).apply(
+                    lambda x: any(kw in x for kw in fail_status_keywords))]
+
             self.transaction_table.setRowCount(len(filtered_df))
             self.row_to_original_index = {}
-            self.transaction_table.setStyleSheet("""
-                QTableWidget::item {
-                    border-bottom: 2.5px solid #3399FF;
-                    border-right: 2.5px solid #3399FF;
-                }
-            """)
+
             for row_idx, (original_index, row_data) in enumerate(filtered_df.iterrows()):
                 self.row_to_original_index[row_idx] = original_index
                 time_str = str(row_data.get('交易时间', ''))
@@ -295,8 +317,18 @@ class MainWindow(QMainWindow):
                         time_str = time_obj.strftime('%Y-%m-%d %H:%M:%S')
                     except Exception:
                         pass
+
                 status_str = str(row_data.get('交易状态', ''))
                 is_fail = any(kw in status_str for kw in fail_status_keywords)
+
+                # 确定行的背景色
+                if is_fail:
+                    row_color = QColor(255, 200, 200)  # 失败交易使用淡红色
+                elif row_idx % 2 == 0:
+                    row_color = QColor(230, 240, 188)  # 偶数行
+                else:
+                    row_color = QColor(255, 255, 255)  # 奇数行
+
                 items = [
                     QTableWidgetItem(time_str),
                     QTableWidgetItem(str(row_data.get('平台', ''))),
@@ -304,18 +336,24 @@ class MainWindow(QMainWindow):
                     QTableWidgetItem(str(row_data.get('交易对方', ''))),
                     QTableWidgetItem(str(row_data.get('商品说明', ''))),
                     QTableWidgetItem(str(row_data.get('收/支', ''))),
-                    QTableWidgetItem(f"¥{float(row_data.get('金额', 0) or 0):.2f}" if row_data.get('金额', 0) != '' else ''),
+                    QTableWidgetItem(
+                        f"¥{float(row_data.get('金额', 0) or 0):.2f}" if row_data.get('金额', 0) != '' else ''),
                     QTableWidgetItem(str(row_data.get('支付方式', '') or row_data.get('收/付款方式', ''))),
                     QTableWidgetItem(status_str),
-                    QTableWidgetItem(str(row_data.get('交易单号', ''))),
                     QTableWidgetItem("未达到分类" if is_fail else str(row_data.get('调整后分类', ''))),
                     QTableWidgetItem("未达到分类" if is_fail else str(row_data.get('调整后子分类', ''))),
                     QTableWidgetItem(str(row_data.get('分类来源', '')))
                 ]
+
+                # 设置所有单元格的背景色
+                for item in items:
+                    item.setBackground(row_color)
+                    # 确保背景色不会被样式覆盖
+                    item.setData(Qt.ItemDataRole.BackgroundRole, row_color)
+
                 for col, item in enumerate(items):
-                    if row_idx % 2 == 0:
-                        item.setBackground(QColor(220, 240, 255))
                     self.transaction_table.setItem(row_idx, col, item)
+
         except Exception as e:
             logging.exception("MainWindow.filter_transactions异常")
             QMessageBox.critical(self, "错误", f"筛选交易时出错: {e}")
